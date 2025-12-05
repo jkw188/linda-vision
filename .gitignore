@@ -1,0 +1,5 @@
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

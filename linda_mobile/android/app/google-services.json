@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "927153736402",
+    "project_id": "lindavision-c4631",
+    "storage_bucket": "lindavision-c4631.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:927153736402:android:9d3913af493cb5e47b3b0b",
+        "android_client_info": {
+          "package_name": "com.example.linda_mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDlVL7PwB9GUt_9vjftu0jU8kwMFnuguCI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

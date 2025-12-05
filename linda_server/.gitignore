@@ -1,0 +1,24 @@
+# --- Python General ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual Environment (QUAN TRỌNG: Không bao giờ push thư mục này) ---
+venv/
+env/
+.env
+
+# --- Project Data (Dữ liệu người dùng upload) ---
+# Bạn không nên push ảnh/file test lên repo chính
+uploaded_files/
+uploaded_images/
+
+# --- AI Models & Weights ---
+# Nếu file weight quá nặng (>100MB), GitHub sẽ chặn.
+# yolov8n.pt (~6MB) thì có thể push được.
+# Nhưng thư mục ai_weights có thể chứa các checkpoint training nặng, nên ignore.
+ai_weights/
+runs/
+
+# --- IDE trong subfolder (đề phòng) ---
+.vscode/
