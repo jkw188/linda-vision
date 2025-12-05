@@ -1,80 +1,78 @@
 import whisper
 import os
-from gtts import gTTS
 import base64
+import noisereduce as nr
+import soundfile as sf
+import librosa
+from gtts import gTTS
 
-# Biến toàn cục lưu model
+# Biến toàn cục
 _stt_model = None
 
 def load_stt_model():
-    """
-    Load model Whisper (chỉ load 1 lần)
-    """
     global _stt_model
     if _stt_model is None:
-        print("Đang tải model Whisper (Speech-to-Text)...")
-        # Sử dụng model 'base' cho nhanh. Nếu máy mạnh có thể đổi thành 'small'
-        # _stt_model = whisper.load_model("base") 
-        _stt_model = whisper.load_model("small") 
-        print("Model Whisper đã sẵn sàng!")
+        print("--- Loading Whisper (STT)...")
+        # Dùng model 'base' cho nhanh. Nếu máy mạnh có thể đổi thành 'small'
+        _stt_model = whisper.load_model("base") 
     return _stt_model
 
-def transcribe_audio(audio_path: str) -> str:
+# --- 1. LỌC NHIỄU (Điểm cộng kỹ thuật) ---
+def clean_audio(file_path: str):
     """
-    Input: Đường dẫn file âm thanh (.wav, .mp3, .m4a...)
-    Output: Văn bản tiếng Việt
+    Sử dụng thư viện noisereduce để làm sạch tạp âm nền
+    trước khi đưa vào nhận dạng.
     """
-    model = load_stt_model()
-    
     try:
-        # Chạy nhận dạng
-        # fp16=False để tránh lỗi nếu chạy trên CPU (không có GPU NVIDIA)
-        result = model.transcribe(
-            audio_path, 
-            fp16=False, 
-            language="vi",
-            temperature=0, # chọn kết quả có xác suất cao nhất, không random
-            condition_on_previous_text=False, # không dựa vào ngữ cảnh cũ (tránh lặp từ)
-            best_of=1, # chỉ lấy 1 mẫu tốt nhất
-            beam_size=1  # giảm beam search để chạy nhanh và bớt "ảo giác"
-        ) 
-        text = result["text"].strip()
+        # Đọc file audio
+        data, rate = librosa.load(file_path, sr=None)
         
-        # Kiểm tra nếu text trả về là các cụm từ ảo giác phổ biến của Whisper thì loại bỏ
-        hallucinations = ["Subtitles by", "Amara.org", "bối rối", "Copyright"]
-        if any(h in text for h in hallucinations):
-            return ""
+        # Giảm nhiễu (Stationary noise reduction)
+        # prop_decrease=0.75 nghĩa là giảm 75% tiếng ồn nền tìm thấy
+        reduced_noise = nr.reduce_noise(y=data, sr=rate, stationary=True, prop_decrease=0.75)
+        
+        # Lưu đè lại file đã sạch
+        sf.write(file_path, reduced_noise, rate)
+    except Exception as e:
+        print(f"Lỗi lọc nhiễu (bỏ qua): {e}")
 
-        if not text:
-            return ""
-            
+# --- 2. NHẬN DẠNG GIỌNG NÓI (WHISPER) ---
+def transcribe_audio(audio_path: str) -> str:
+    # Bước 1: Tiền xử lý (Lọc nhiễu)
+    clean_audio(audio_path)
+    
+    # Bước 2: Load model và nhận dạng
+    model = load_stt_model()
+    try:
+        # fp16=False để chạy ổn định trên CPU
+        result = model.transcribe(audio_path, fp16=False, language="vi")
+        text = result["text"].strip()
         return text
     except Exception as e:
-        print(f"Lỗi STT: {e}")
+        print(f"Lỗi STT Whisper: {e}")
         return ""
-    
 
+# --- 3. TỔNG HỢP GIỌNG NÓI (GOOGLE TTS) ---
 def text_to_speech(text: str, output_filename: str) -> str:
     """
-    Input: Văn bản tiếng Việt
-    Output: Chuỗi Base64 của file âm thanh (để gửi qua JSON)
+    Sử dụng Google TTS API - Ổn định và nhanh nhất cho demo.
     """
+    save_path = f"uploaded_files/{output_filename}"
+    
     try:
-        print(f"Đang sinh giọng nói cho: {text}")
-        # 1. Sinh file mp3 từ text
-        tts = gTTS(text=text, lang='vi')
+        print(f"Đang sinh giọng nói (Google): {text[:30]}...")
         
-        # Lưu tạm vào file
-        save_path = f"uploaded_files/{output_filename}"
+        # Gọi Google API
+        tts = gTTS(text=text, lang='vi')
         tts.save(save_path)
         
-        # 2. Đọc file vừa sinh ra và mã hóa thành Base64
-        # (Lý do: Để gửi kèm luôn trong cục JSON trả về cho tiện)
+        # Đọc file vừa lưu và mã hóa Base64 để gửi về App
         with open(save_path, "rb") as audio_file:
             audio_bytes = audio_file.read()
             base64_string = base64.b64encode(audio_bytes).decode('utf-8')
             
         return base64_string
+        
     except Exception as e:
         print(f"Lỗi TTS: {e}")
         return ""

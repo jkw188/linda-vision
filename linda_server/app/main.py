@@ -3,13 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import shutil
 import os
-from typing import Optional
 import time
+from typing import Optional
 
-# Import các services
-from app.services.vision_service import analyze_image_with_yolo
-from app.services.speech_service import transcribe_audio
-from app.services.speech_service import text_to_speech
+# Import hàm mới (analyze_image_multimodal)
+from app.services.vision_service import analyze_image_multimodal
+from app.services.speech_service_with_pho import transcribe_audio, text_to_speech
 
 app = FastAPI()
 
@@ -24,62 +23,50 @@ app.add_middleware(
 UPLOAD_DIR = "uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.get("/")
-async def root():
-    return {"message": "Linda Vision & Voice Server"}
-
 @app.post("/chat-multimodal")
 async def chat_multimodal(
     audio_file: UploadFile = File(...), 
     image_file: Optional[UploadFile] = File(None)
 ):
-    """
-    API nhận cả Âm thanh (lệnh) và Ảnh (ngữ cảnh)
-    """
-    response_text = ""
-    
-    # --- BƯỚC 1: XỬ LÝ ÂM THANH (STT) ---
-    # Lưu file audio tạm thời
+    # 1. Xử lý Audio (Đã bao gồm lọc nhiễu bên trong transcribe_audio)
     audio_path = f"{UPLOAD_DIR}/{audio_file.filename}"
     with open(audio_path, "wb") as buffer:
         shutil.copyfileobj(audio_file.file, buffer)
         
-    print(f"Đang nghe lệnh từ file: {audio_file.filename}...")
+    print(f"--- Nhận lệnh: {audio_file.filename}")
     user_command = transcribe_audio(audio_path)
-    print(f"Người dùng nói: {user_command}")
+    print(f"--- Người dùng: {user_command}")
     
     if not user_command:
-        return {"reply": "Xin lỗi, tôi không nghe rõ bạn nói gì."}
+        return {"reply": "Tôi không nghe rõ."}
 
-    # --- BƯỚC 2: PHÂN TÍCH Ý ĐỊNH (Logic đơn giản) ---
-    # Kiểm tra xem câu nói có từ khóa liên quan đến 'nhìn' không
-    keywords_vision = ["nhìn", "thấy", "xem", "gì", "đâu", "trước mặt"]
+    # 2. Logic Trợ lý
+    keywords_vision = ["nhìn", "thấy", "xem", "gì", "đâu", "trước mặt", "cảnh"]
     should_look = any(word in user_command.lower() for word in keywords_vision)
 
     vision_result = ""
+    response_text = ""
     
     if should_look and image_file:
-        # --- BƯỚC 3: NẾU CẦN NHÌN -> GỌI YOLO ---
-        print("Phát hiện yêu cầu thị giác. Đang xử lý ảnh...")
+        print("--- Đang phân tích ảnh (BLIP + YOLO)...")
         image_path = f"{UPLOAD_DIR}/{image_file.filename}"
         with open(image_path, "wb") as buffer:
             shutil.copyfileobj(image_file.file, buffer)
             
-        vision_result = analyze_image_with_yolo(image_path)
-        
-        # Ghép câu trả lời
-        response_text = f"Bạn vừa hỏi: '{user_command}'. {vision_result}"
+        # Gọi hàm Vision mới
+        vision_result = analyze_image_multimodal(image_path)
+        response_text = f"{vision_result}" # Trả lời thẳng vào vấn đề
     
     elif should_look and not image_file:
-        response_text = "Bạn muốn tôi nhìn, nhưng tôi chưa nhận được hình ảnh nào cả."
-        
+        response_text = "Tôi cần nhìn, nhưng camera chưa gửi ảnh."
     else:
-        # Nếu chỉ chào hỏi bình thường
-        response_text = f"Chào bạn, tôi đã nghe thấy bạn nói: '{user_command}'. Tôi có thể giúp gì?"
+        response_text = f"Tôi đã nghe bạn nói: {user_command}"
 
+    print(f"--- Linda trả lời: {response_text}")
+
+    # 3. Sinh giọng nói (Voice Cloning hoặc Google)
     audio_base64 = ""
     if response_text:
-        # Tạo tên file unique dựa trên thời gian
         filename = f"reply_{int(time.time())}.mp3"
         audio_base64 = text_to_speech(response_text, filename)
 
@@ -87,7 +74,7 @@ async def chat_multimodal(
         "user_text": user_command,
         "vision_info": vision_result,
         "reply": response_text,
-        "audio_response": audio_base64  # <--- Gửi kèm cục âm thanh này về
+        "audio_response": audio_base64
     }
 
 if __name__ == "__main__":

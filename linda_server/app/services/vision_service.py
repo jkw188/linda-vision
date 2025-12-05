@@ -1,54 +1,101 @@
 from ultralytics import YOLO
-import collections
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from PIL import Image
+from deep_translator import GoogleTranslator
+import torch
 
-# Khởi tạo model biến toàn cục (Global variable)
-# Để tránh việc load lại model mỗi khi có request mới (rất chậm)
-_model = None
+# Biến toàn cục lưu model
+_yolo_model = None
+_blip_processor = None
+_blip_model = None
+_translator = None
 
-def load_model():
-    """
-    Hàm này đảm bảo model chỉ được load 1 lần duy nhất khi server khởi động
-    """
-    global _model
-    if _model is None:
-        print("dang tai model YOLOv8...")
-        _model = YOLO("yolov8n.pt") 
-        print("Model YOLOv8 da san sang!")
-    return _model
-
-def analyze_image_with_yolo(image_path: str) -> str:
-    """
-    Input: Đường dẫn file ảnh
-    Output: Câu mô tả các vật thể nhìn thấy (String)
-    """
-    model = load_model()
+def load_vision_models():
+    global _yolo_model, _blip_processor, _blip_model, _translator
     
-    # Chạy suy luận (Inference)
-    # conf=0.5 nghĩa là chỉ lấy vật thể nào AI chắc chắn trên 50%
-    results = model(image_path, conf=0.5) 
-    
-    detected_objects = []
-    
-    # Lấy danh sách tên các vật thể
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            class_name = model.names[class_id]
-            detected_objects.append(class_name)
-            
-    # Nếu không thấy gì
-    if not detected_objects:
-        return "Linda không nhìn thấy vật thể nào rõ ràng."
-
-    # Đếm số lượng: Counter({'person': 2, 'car': 1})
-    counts = collections.Counter(detected_objects)
-    
-    # Tạo câu mô tả tiếng Việt (Tạm thời map tên tiếng Anh -> Việt đơn giản)
-    # Sau này bạn có thể dùng Google Translate API ở đây nếu muốn xịn hơn
-    description_parts = []
-    for obj, count in counts.items():
-        description_parts.append(f"{count} {obj}")
+    # 1. Load YOLO (Nhẹ)
+    if _yolo_model is None:
+        print("--- Loading YOLOv8...")
+        _yolo_model = YOLO("yolov8n.pt")
         
-    description_text = ", ".join(description_parts)
+    # 2. Load BLIP (Nặng - Khoảng 1GB)
+    if _blip_model is None:
+        print("--- Loading BLIP (Image Captioning)...")
+        # Sử dụng model base của Salesforce
+        _blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        _blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
     
-    return f"Linda nhìn thấy: {description_text}"
+    # 3. Khởi tạo dịch giả (Anh -> Việt)
+    if _translator is None:
+        _translator = GoogleTranslator(source='auto', target='vi')
+        
+    return _yolo_model, _blip_processor, _blip_model, _translator
+
+def estimate_distance(box_area, image_area):
+    """
+    Giả lập MiDaS: Ước lượng khoảng cách dựa trên diện tích chiếm dụng của vật thể
+    """
+    ratio = box_area / image_area
+    if ratio > 0.5: return "rất gần (ngay trước mặt)"
+    if ratio > 0.2: return "gần (khoảng 1-2 mét)"
+    if ratio > 0.05: return "cách khoảng 3-5 mét"
+    return "ở phía xa"
+
+def analyze_image_multimodal(image_path: str) -> str:
+    """
+    Kết hợp YOLO + BLIP + Distance Heuristic
+    """
+    yolo, processor, blip_model, translator = load_vision_models()
+    
+    # --- PHẦN 1: MÔ TẢ NGỮ CẢNH (BLIP) ---
+    try:
+        raw_image = Image.open(image_path).convert('RGB')
+        # Chuẩn bị ảnh cho BLIP
+        inputs = processor(raw_image, return_tensors="pt")
+        # Sinh câu mô tả (Tiếng Anh)
+        out = blip_model.generate(**inputs, max_new_tokens=50)
+        caption_en = processor.decode(out[0], skip_special_tokens=True)
+        # Dịch sang Tiếng Việt
+        caption_vi = translator.translate(caption_en)
+    except Exception as e:
+        print(f"Lỗi BLIP: {e}")
+        caption_vi = "Tôi thấy một khung cảnh."
+
+    # --- PHẦN 2: CHI TIẾT VẬT THỂ & KHOẢNG CÁCH (YOLO) ---
+    results = yolo(image_path, conf=0.5, verbose=False)
+    
+    img_width, img_height = raw_image.size
+    total_area = img_width * img_height
+    
+    detected_details = []
+    
+    for r in results:
+        for box in r.boxes:
+            # Lấy tên vật thể
+            cls_id = int(box.cls[0])
+            name_en = yolo.names[cls_id]
+            
+            # Tính diện tích box để đoán khoảng cách
+            w_box = box.xywh[0][2]
+            h_box = box.xywh[0][3]
+            box_area = float(w_box * h_box)
+            
+            dist_desc = estimate_distance(box_area, total_area)
+            
+            # Dịch tên vật thể sang tiếng Việt (Sơ bộ)
+            name_map = {"person": "người", "car": "xe hơi", "motorcycle": "xe máy", "dog": "chó", "cat": "mèo", "chair": "cái ghế"}
+            name_vi = name_map.get(name_en, name_en)
+            
+            detected_details.append(f"một {name_vi} đang {dist_desc}")
+
+    # --- TỔNG HỢP CÂU TRẢ LỜI ---
+    # Ví dụ: "Khung cảnh là một người đàn ông đi trên phố. Cụ thể, tôi thấy: một người đang rất gần, một xe hơi ở xa."
+    
+    final_response = f"Khung cảnh chung là {caption_vi}."
+    
+    if detected_details:
+        # Lấy tối đa 3 vật thể to nhất để không bị dài dòng
+        details_text = ", ".join(detected_details[:3])
+        final_response += f" Cụ thể, tôi thấy: {details_text}."
+    
+    return final_response
