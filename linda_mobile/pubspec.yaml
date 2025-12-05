@@ -43,6 +43,9 @@ dependencies:
   vibration: ^3.1.4
   firebase_core: ^4.2.1
   cloud_firestore: ^6.1.0
+  porcupine_flutter: ^3.0.6
+  camera: ^0.11.3
+  wakelock_plus: ^1.4.0
 
 dev_dependencies:
   flutter_test:
@@ -60,7 +63,9 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
-
+  assets:
+    - assets/porcupine/hey_linda_android.ppn
+    - assets/porcupine/porcupine_params.pv
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
   # the material Icons class.

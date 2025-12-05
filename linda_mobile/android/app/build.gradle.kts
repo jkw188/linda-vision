@@ -25,7 +25,12 @@ android {
         applicationId = "com.example.linda_mobile"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        
+        // --- CẬP NHẬT CHO PORCUPINE ---
+        // Porcupine yêu cầu tối thiểu API 21. 
+        // Thay vì dùng flutter.minSdkVersion, ta gán cứng 21 để đảm bảo tương thích.
+        minSdk = flutter.minSdkVersion 
+        
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
