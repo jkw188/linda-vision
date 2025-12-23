@@ -34,6 +34,7 @@ Future<void> main() async {
     print("Chế độ Offline (Lỗi Firebase: $e)");
   }
 
+  // 2. Lấy danh sách Camera
   try {
     _cameras = await availableCameras();
   } catch (e) {
@@ -75,8 +76,8 @@ class _LindaOptimizedState extends State<LindaOptimized>
   PorcupineManager? _porcupineManager;
 
   File? _imageFile;
-  bool _isRecording = false;
-  bool _isProcessing = false;
+  bool _isRecording = false; // Trạng thái đang ghi âm
+  bool _isProcessing = false; // Trạng thái đang xử lý (gửi server/nhận về)
 
   String get serverUrl {
     // 10.0.2.2 là localhost của máy tính khi chạy trên máy ảo Android
@@ -108,8 +109,8 @@ class _LindaOptimizedState extends State<LindaOptimized>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // Khi quay lại app, nếu mic lỡ bị tắt thì bật lại
-      if (_porcupineManager != null) {
+      // Khi quay lại app, nếu hệ thống đang rảnh thì bật lại mic nghe
+      if (!_isRecording && !_isProcessing && _porcupineManager != null) {
         _startWakeWordListener();
       }
     }
@@ -124,13 +125,13 @@ class _LindaOptimizedState extends State<LindaOptimized>
     print("--- ĐANG BẬT CAMERA NGẦM ---");
     _cameraController = CameraController(
       _cameras.first,
-      ResolutionPreset.low, // Để low cho nhanh
+      ResolutionPreset.medium,
       enableAudio: false,
     );
     try {
       await _cameraController!.initialize();
       await _cameraController!.setFlashMode(FlashMode.off);
-      if (mounted) setState(() {}); // Cập nhật UI nếu cần
+      if (mounted) setState(() {});
     } catch (e) {
       print("Lỗi bật Camera: $e");
     }
@@ -155,7 +156,7 @@ class _LindaOptimizedState extends State<LindaOptimized>
         ["assets/porcupine/hey_linda_android.ppn"],
         _wakeWordCallback,
         modelPath: "assets/porcupine/porcupine_params.pv",
-        sensitivities: [1.0],
+        sensitivities: [1.0], // Nhạy tối đa
       );
       await _startWakeWordListener();
       if (mounted) setState(() => trangThai = "SẴN SÀNG! NÓI 'HEY LINDA'");
@@ -179,44 +180,71 @@ class _LindaOptimizedState extends State<LindaOptimized>
     await _porcupineManager?.stop();
   }
 
-  // --- KHI NGHE THẤY TỪ KHÓA ---
+  // --- LOGIC CHÍNH: KHI NGHE THẤY TỪ KHÓA ---
   void _wakeWordCallback(int keywordIndex) async {
-    // Dừng nghe từ khóa để tránh xung đột Mic
+    print("1. ĐÃ NGHE THẤY HEY LINDA!");
+
+    // B1: Dừng nghe từ khóa ngay lập tức để giải phóng Mic
     await _stopWakeWordListener();
 
-    print("ĐÃ NGHE THẤY HEY LINDA!");
+    if (mounted) setState(() => trangThai = "LINDA ĐANG NGHE...");
 
-    _playTingSound();
+    // B2: Phát tiếng Ting và CHỜ nó kết thúc (Khắc phục lỗi ghi âm dính tiếng Ting)
+    await _playTingSoundAndWait();
+
+    // B3: Rung nhẹ báo hiệu
     await rungNhe();
 
-    // Bắt đầu quy trình ghi âm và chụp ảnh
+    // B4: Bắt đầu ghi âm và chụp ảnh
     batDauGhiAmVaBatCamera();
   }
 
-  Future<void> _playTingSound() async {
+  // Hàm phát âm thanh có cơ chế chờ (Blocking wait)
+  Future<void> _playTingSoundAndWait() async {
     try {
-      await _effectPlayer.play(AssetSource('sounds/ting.mp3'));
+      final completer = Completer<void>();
+
+      // Set source
+      await _effectPlayer.setSource(AssetSource('sounds/ting.mp3'));
+
+      // Lắng nghe sự kiện hoàn thành
+      StreamSubscription? subscription;
+      subscription = _effectPlayer.onPlayerComplete.listen((event) {
+        if (!completer.isCompleted) completer.complete();
+        subscription?.cancel();
+      });
+
+      // Bắt đầu phát
+      await _effectPlayer.resume();
+
+      // Fallback: Tự ngắt sau 1.5s phòng trường hợp lỗi không có event complete
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        if (!completer.isCompleted) {
+          completer.complete();
+          subscription?.cancel();
+        }
+      });
+
+      await completer.future; // Code sẽ dừng ở đây cho đến khi ting xong
     } catch (e) {
-      print("Chưa có file âm thanh Ting Ting: $e");
+      print("Lỗi phát Ting: $e");
     }
   }
 
-  // --- UPDATE: GHI ÂM DẠNG WAV ---
   Future<void> batDauGhiAmVaBatCamera() async {
     try {
       _khoiTaoCamera(); // Bật cam ngầm song song
 
       if (await _audioRecorder.hasPermission()) {
         final directory = await getTemporaryDirectory();
-
-        // UPDATE 1: Đổi đuôi file thành .wav
         String path = '${directory.path}/lenh.wav';
 
-        // UPDATE 2: Cấu hình Encoder là WAV
+        // --- CẤU HÌNH ĐÃ SỬA ---
         const config = RecordConfig(
           encoder: AudioEncoder.wav,
-          sampleRate: 16000, // Whisper thích tần số này
+          sampleRate: 16000,
           numChannels: 1,
+          // Đã xóa các tham số noiseSuppression/echoCancellation gây lỗi
         );
 
         if (mounted) {
@@ -228,10 +256,16 @@ class _LindaOptimizedState extends State<LindaOptimized>
           });
         }
 
-        // UPDATE 3: Delay nhỏ để đảm bảo Mic đã được giải phóng hoàn toàn
-        await Future.delayed(const Duration(milliseconds: 200));
+        // --- Delay quan trọng để OS chuyển Mic mode ---
+        await Future.delayed(const Duration(milliseconds: 300));
+
+        // Đảm bảo không có tiến trình ghi âm nào đang chạy
+        if (await _audioRecorder.isRecording()) {
+          await _audioRecorder.stop();
+        }
 
         await _audioRecorder.start(config, path: path);
+        print("2. Đang ghi âm...");
 
         // Ghi âm trong 4 giây rồi tự dừng
         Future.delayed(const Duration(seconds: 4), dungGhiAmVaChupAnh);
@@ -243,10 +277,11 @@ class _LindaOptimizedState extends State<LindaOptimized>
   }
 
   Future<void> dungGhiAmVaChupAnh() async {
-    if (!_isRecording) return;
+    if (!_isRecording) return; // Tránh gọi 2 lần
     if (!mounted) return;
 
     try {
+      print("3. Dừng ghi âm...");
       final path = await _audioRecorder.stop();
       await rungNhe();
 
@@ -261,30 +296,36 @@ class _LindaOptimizedState extends State<LindaOptimized>
       // Chụp ảnh
       if (_cameraController != null && _cameraController!.value.isInitialized) {
         final XFile photo = await _cameraController!.takePicture();
+        print("4. Đã chụp ảnh");
 
         if (mounted) {
           setState(() => _imageFile = File(photo.path));
         }
 
-        _disposeCamera(); // Tắt cam ngay sau khi chụp để tiết kiệm pin
+        _disposeCamera(); // Tắt cam ngay để tiết kiệm pin
 
-        // Gửi lên server (path bây giờ là file .wav)
-        await guiDuLieuDaPhuongTien(File(path!), File(photo.path));
+        // Gửi lên server
+        if (path != null) {
+          await guiDuLieuDaPhuongTien(File(path), File(photo.path));
+        } else {
+          print("File ghi âm bị null");
+          _resetHeThongDeLangNgheTiep();
+        }
       } else {
         print("Camera chưa sẵn sàng");
         _disposeCamera();
         _resetHeThongDeLangNgheTiep();
       }
     } catch (e) {
-      print("Lỗi dừng ghi/chụp: $e");
+      print("Lỗi quy trình dừng: $e");
       _disposeCamera();
       _resetHeThongDeLangNgheTiep();
     }
   }
 
-  // --- HÀM TỰ ĐỘNG RESET ---
+  // --- HÀM RESET HỆ THỐNG ---
   void _resetHeThongDeLangNgheTiep() {
-    print("--- ĐANG RESET HỆ THỐNG ĐỂ NGHE TIẾP ---");
+    print("--- RESET: LẮNG NGHE LẠI ---");
     if (mounted) {
       setState(() {
         _isProcessing = false;
@@ -292,22 +333,22 @@ class _LindaOptimizedState extends State<LindaOptimized>
         trangThai = "SẴN SÀNG! NÓI 'HEY LINDA'";
       });
     }
-    _startWakeWordListener(); // Bật lại Porcupine
+    // Chỉ bật lại Wake Word khi không bận
+    _startWakeWordListener();
   }
 
   Future<void> guiDuLieuDaPhuongTien(File audio, File image) async {
     try {
       var request = http.MultipartRequest('POST', Uri.parse(serverUrl));
 
-      // Gửi file Audio (đã là .wav)
       request.files.add(
         await http.MultipartFile.fromPath('audio_file', audio.path),
       );
-      // Gửi file Ảnh
       request.files.add(
         await http.MultipartFile.fromPath('image_file', image.path),
       );
 
+      print("5. Đang gửi server...");
       var streamedResponse = await request.send();
       var response = await http.Response.fromStream(streamedResponse);
 
@@ -328,8 +369,9 @@ class _LindaOptimizedState extends State<LindaOptimized>
 
         // Phát âm thanh trả lời
         if (data['audio_response'] != null) {
-          await phatAmThanh(data['audio_response']);
+          await phatAmThanhVaCho(data['audio_response']);
         } else {
+          // Nếu server không trả về audio thì chờ 3s rồi reset
           Future.delayed(
             const Duration(seconds: 3),
             _resetHeThongDeLangNgheTiep,
@@ -338,15 +380,15 @@ class _LindaOptimizedState extends State<LindaOptimized>
       } else {
         if (mounted)
           setState(() => trangThai = "Lỗi Server: ${response.statusCode}");
-        _resetHeThongDeLangNgheTiep();
+        Future.delayed(const Duration(seconds: 2), _resetHeThongDeLangNgheTiep);
       }
     } catch (e) {
+      print("Lỗi kết nối Server: $e");
       if (mounted) setState(() => trangThai = "Mất kết nối Server");
-      _resetHeThongDeLangNgheTiep();
+      Future.delayed(const Duration(seconds: 2), _resetHeThongDeLangNgheTiep);
     }
   }
 
-  // --- LƯU FIREBASE ---
   Future<void> luuLichSuVaoFirestore(String cauHoi, String traLoi) async {
     try {
       await FirebaseFirestore.instance.collection('activity_logs').add({
@@ -356,7 +398,6 @@ class _LindaOptimizedState extends State<LindaOptimized>
         'device_type': Platform.isAndroid ? 'Android' : 'iOS',
         'status': 'success',
       });
-      print("Đã lưu log vào Firestore!");
     } catch (e) {
       print("Lỗi lưu log Firebase: $e");
     }
@@ -368,20 +409,31 @@ class _LindaOptimizedState extends State<LindaOptimized>
     }
   }
 
-  Future<void> phatAmThanh(String base64String) async {
+  // Hàm phát âm thanh trả lời cũng cần cơ chế Wait
+  Future<void> phatAmThanhVaCho(String base64String) async {
     try {
       Uint8List audioBytes = base64Decode(base64String);
       final dir = await getTemporaryDirectory();
       File file = File('${dir.path}/reply.mp3');
       await file.writeAsBytes(audioBytes);
 
+      final completer = Completer<void>();
+
       await _audioPlayer.play(DeviceFileSource(file.path));
 
-      // Lắng nghe khi phát xong -> TỰ ĐỘNG RESET
-      _audioPlayer.onPlayerComplete.listen((_) {
-        _resetHeThongDeLangNgheTiep();
+      // Lắng nghe khi phát xong
+      StreamSubscription? sub;
+      sub = _audioPlayer.onPlayerComplete.listen((_) {
+        if (!completer.isCompleted) completer.complete();
+        sub?.cancel();
       });
+
+      await completer.future; // Chờ Linda nói xong
+
+      // Nói xong mới Reset để nghe lệnh tiếp theo
+      _resetHeThongDeLangNgheTiep();
     } catch (e) {
+      print("Lỗi phát reply: $e");
       _resetHeThongDeLangNgheTiep();
     }
   }
@@ -392,10 +444,9 @@ class _LindaOptimizedState extends State<LindaOptimized>
       floatingActionButton: FloatingActionButton(
         backgroundColor: _isRecording ? Colors.red : Colors.blueGrey,
         onPressed: () {
+          // Cho phép kích hoạt bằng nút bấm thủ công
           if (!_isRecording && !_isProcessing) {
-            _stopWakeWordListener();
-            _playTingSound();
-            batDauGhiAmVaBatCamera();
+            _wakeWordCallback(0); // Giả lập như nghe thấy từ khóa
           }
         },
         child: Icon(_isRecording ? Icons.stop : Icons.mic),
@@ -406,7 +457,7 @@ class _LindaOptimizedState extends State<LindaOptimized>
         color: Colors.black,
         child: Column(
           children: [
-            // Preview Camera nhỏ xíu (ẩn)
+            // Preview Camera ẩn (1x1 pixel)
             SizedBox(
               width: 1,
               height: 1,
@@ -419,51 +470,62 @@ class _LindaOptimizedState extends State<LindaOptimized>
 
             Expanded(
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    // Hiển thị ảnh vừa chụp (nếu có)
-                    if (_imageFile != null)
-                      Container(
-                        height: 200,
-                        width: 200,
-                        margin: const EdgeInsets.only(bottom: 20),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.white),
+                child: SingleChildScrollView(
+                  // Thêm scroll để không bị lỗi overflow khi text dài
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (_imageFile != null)
+                        Container(
+                          height: 200,
+                          width: 200,
+                          margin: const EdgeInsets.only(bottom: 20),
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.white, width: 2),
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(13),
+                            child: Image.file(_imageFile!, fit: BoxFit.cover),
+                          ),
                         ),
-                        child: Image.file(_imageFile!, fit: BoxFit.cover),
-                      ),
 
-                    Icon(
-                      _isRecording ? Icons.mic : Icons.hearing,
-                      size: 100,
-                      color: _isRecording
-                          ? Colors.redAccent
-                          : Colors.greenAccent,
-                    ),
-                    const SizedBox(height: 20),
-                    Text(
-                      trangThai,
-                      style: TextStyle(
-                        color: _isRecording ? Colors.red : Colors.greenAccent,
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
+                      Icon(
+                        _isRecording
+                            ? Icons.mic
+                            : (_isProcessing ? Icons.sync : Icons.hearing),
+                        size: 100,
+                        color: _isRecording
+                            ? Colors.redAccent
+                            : (_isProcessing
+                                  ? Colors.blueAccent
+                                  : Colors.greenAccent),
                       ),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 20),
-                    Padding(
-                      padding: const EdgeInsets.all(20),
-                      child: Text(
-                        cauTraLoiCuaLinda,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
+                      const SizedBox(height: 20),
+                      Text(
+                        trangThai,
+                        style: TextStyle(
+                          color: _isRecording ? Colors.red : Colors.greenAccent,
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
                         ),
                         textAlign: TextAlign.center,
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 20),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        child: Text(
+                          cauTraLoiCuaLinda,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            height: 1.5,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
