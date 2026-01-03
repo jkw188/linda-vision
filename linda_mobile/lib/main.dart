@@ -1,86 +1,89 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
 import 'dart:typed_data';
+
+// --- WEB ONLY IMPORT (Remove if building for Android/iOS) ---
+import 'dart:html' as html;
+
 import 'package:audioplayers/audioplayers.dart';
 import 'package:camera/camera.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'dart:convert';
-import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:vibration/vibration.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:porcupine_flutter/porcupine_manager.dart';
-import 'package:porcupine_flutter/porcupine_error.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-// --- CẤU HÌNH ---
-const String PICOVOICE_ACCESS_KEY =
-    "90LGHncAk9HhZ1zv/MauEm6nbhdzB1Pw/0i8ZgCzNJ06387D/kN74Q=="; // Key của bạn
+// --- CONFIGURATION ---
+const String PICOVOICE_ACCESS_KEY = "YOUR_KEY_HERE";
 
 List<CameraDescription> _cameras = [];
+bool _isFirebaseReady = false;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 1. Khôi phục Firebase
   try {
-    await Firebase.initializeApp();
-    print("Kết nối Firebase thành công!");
+    if (kIsWeb) {
+      print("⚠️ WEB MODE: Firebase Logging disabled.");
+    } else {
+      await Firebase.initializeApp();
+      _isFirebaseReady = true;
+    }
   } catch (e) {
-    print("Chế độ Offline (Lỗi Firebase: $e)");
+    print("⚠️ Offline Mode (Firebase Error: $e)");
   }
 
-  // 2. Lấy danh sách Camera
-  try {
-    _cameras = await availableCameras();
-  } catch (e) {
-    print("Lỗi Cam: $e");
-  }
+  // We do NOT init cameras here anymore to prevent startup crash.
+  // We moved it to _initSystem inside the UI.
+
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Linda Vision',
-      theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: Colors.black),
-      home: const LindaOptimized(),
+      title: 'Linda Vision Web',
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: Colors.black,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.cyanAccent,
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const LindaWebOptimized(),
     );
   }
 }
 
-class LindaOptimized extends StatefulWidget {
-  const LindaOptimized({super.key});
+class LindaWebOptimized extends StatefulWidget {
+  const LindaWebOptimized({super.key});
+
   @override
-  State<LindaOptimized> createState() => _LindaOptimizedState();
+  State<LindaWebOptimized> createState() => _LindaWebOptimizedState();
 }
 
-class _LindaOptimizedState extends State<LindaOptimized>
+class _LindaWebOptimizedState extends State<LindaWebOptimized>
     with WidgetsBindingObserver {
-  String trangThai = "ĐANG KHỞI TẠO...";
-  String cauTraLoiCuaLinda = "";
+  String status = "INITIALIZING...";
+  String lindaResponse = "Hello! Click the mic to start.";
 
   final AudioRecorder _audioRecorder = AudioRecorder();
-  final AudioPlayer _audioPlayer = AudioPlayer(); // Player cho giọng nói AI
-  final AudioPlayer _effectPlayer = AudioPlayer(); // Player cho tiếng Ting Ting
-
-  // Camera và Porcupine
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  final AudioPlayer _effectPlayer = AudioPlayer();
   CameraController? _cameraController;
-  PorcupineManager? _porcupineManager;
 
-  File? _imageFile;
-  bool _isRecording = false; // Trạng thái đang ghi âm
-  bool _isProcessing = false; // Trạng thái đang xử lý (gửi server/nhận về)
+  XFile? _imageFile;
+  Uint8List? _imageBytes;
+  bool _isRecording = false;
+  bool _isProcessing = false;
 
   String get serverUrl {
-    // 10.0.2.2 là localhost của máy tính khi chạy trên máy ảo Android
     String baseUrl = kIsWeb ? "http://127.0.0.1:8000" : "http://10.0.2.2:8000";
     return "$baseUrl/chat-multimodal";
   }
@@ -89,15 +92,14 @@ class _LindaOptimizedState extends State<LindaOptimized>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable(); // Giữ màn hình sáng
-    _khoiTaoHeThong();
+    WakelockPlus.enable();
+    _initSystem();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _porcupineManager?.delete();
-    _disposeCamera();
+    _cameraController?.dispose();
     _audioRecorder.dispose();
     _audioPlayer.dispose();
     _effectPlayer.dispose();
@@ -105,432 +107,411 @@ class _LindaOptimizedState extends State<LindaOptimized>
     super.dispose();
   }
 
-  // --- XỬ LÝ BACKGROUND ---
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      // Khi quay lại app, nếu hệ thống đang rảnh thì bật lại mic nghe
-      if (!_isRecording && !_isProcessing && _porcupineManager != null) {
-        _startWakeWordListener();
-      }
-    }
+  Future<void> _initSystem() async {
+    await _initCameraSafely();
+    if (mounted) setState(() => status = "READY");
   }
 
-  // --- QUẢN LÝ CAMERA ---
-  Future<void> _khoiTaoCamera() async {
-    if (_cameras.isEmpty ||
-        (_cameraController != null && _cameraController!.value.isInitialized)) {
+  // --- SAFE CAMERA INIT FOR WEB ---
+  Future<void> _initCameraSafely() async {
+    try {
+      // 1. Try standard Flutter way first
+      _cameras = await availableCameras();
+    } catch (e) {
+      print("⚠️ Standard Camera Init Failed: $e");
+      // 2. Fallback: Use Browser Native API to find valid cameras
+      _cameras = await _getBrowserCameras();
+    }
+
+    if (_cameras.isEmpty) {
+      print("❌ No usable cameras found.");
       return;
     }
-    print("--- ĐANG BẬT CAMERA NGẦM ---");
-    _cameraController = CameraController(
-      _cameras.first,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
-    try {
-      await _cameraController!.initialize();
-      await _cameraController!.setFlashMode(FlashMode.off);
-      if (mounted) setState(() {});
-    } catch (e) {
-      print("Lỗi bật Camera: $e");
+
+    // 3. Try to initialize the first valid camera
+    for (var camera in _cameras) {
+      try {
+        print("📷 Attempting to open: ${camera.name}");
+        _cameraController = CameraController(
+          camera,
+          ResolutionPreset.low, // Lowest resolution is safest for Web
+          enableAudio: false,
+        );
+        await _cameraController!.initialize();
+        if (mounted) setState(() {});
+        print("✅ Success! Camera opened.");
+        return;
+      } catch (e) {
+        print("⚠️ Failed to open ${camera.name}: $e");
+      }
     }
   }
 
-  Future<void> _disposeCamera() async {
-    if (_cameraController != null) {
-      await _cameraController!.dispose();
-      _cameraController = null;
-    }
-  }
-
-  Future<void> _khoiTaoHeThong() async {
-    await [Permission.microphone, Permission.camera].request();
-    await _initPorcupine();
-  }
-
-  Future<void> _initPorcupine() async {
+  // Helper: Manually get cameras via dart:html to bypass broken drivers (e.g. OBS)
+  Future<List<CameraDescription>> _getBrowserCameras() async {
+    List<CameraDescription> webCameras = [];
     try {
-      _porcupineManager = await PorcupineManager.fromKeywordPaths(
-        PICOVOICE_ACCESS_KEY,
-        ["assets/porcupine/hey_linda_android.ppn"],
-        _wakeWordCallback,
-        modelPath: "assets/porcupine/porcupine_params.pv",
-        sensitivities: [1.0], // Nhạy tối đa
-      );
-      await _startWakeWordListener();
-      if (mounted) setState(() => trangThai = "SẴN SÀNG! NÓI 'HEY LINDA'");
-    } on PorcupineException catch (err) {
-      if (mounted) setState(() => trangThai = "Lỗi Porcupine: ${err.message}");
-    }
-  }
+      // Access browser media devices directly
+      final devices = await html.window.navigator.mediaDevices!
+          .enumerateDevices();
+      for (var device in devices) {
+        if (device.kind == 'videoinput') {
+          print("🔎 Found Web Device: ${device.label}");
+          // SKIP Virtual Cameras which often cause crashes
+          if (device.label!.toLowerCase().contains('virtual') ||
+              device.label!.toLowerCase().contains('obs')) {
+            print("🚫 Skipping Virtual Camera: ${device.label}");
+            continue;
+          }
 
-  Future<void> _startWakeWordListener() async {
-    try {
-      if (_porcupineManager != null) {
-        await _porcupineManager!.start();
-        print("Đang lắng nghe Hey Linda...");
+          webCameras.add(
+            CameraDescription(
+              name: device.label ?? 'Web Camera',
+              lensDirection: CameraLensDirection.front,
+              sensorOrientation: 0,
+            ),
+          );
+        }
       }
     } catch (e) {
-      print("Lỗi Start Mic: $e");
+      print("❌ Native Browser enumeration failed: $e");
     }
+    return webCameras;
   }
 
-  Future<void> _stopWakeWordListener() async {
-    await _porcupineManager?.stop();
+  void startInteraction() async {
+    if (_isProcessing || _isRecording) return;
+    print("--- STARTING INTERACTION ---");
+
+    setState(() => status = "LISTENING...");
+    await _playEffect('sounds/ting.mp3');
+    await _startRecordingAndCamera();
   }
 
-  // --- LOGIC CHÍNH: KHI NGHE THẤY TỪ KHÓA ---
-  void _wakeWordCallback(int keywordIndex) async {
-    print("1. ĐÃ NGHE THẤY HEY LINDA!");
-
-    // B1: Dừng nghe từ khóa ngay lập tức để giải phóng Mic
-    await _stopWakeWordListener();
-
-    if (mounted) setState(() => trangThai = "LINDA ĐANG NGHE...");
-
-    // B2: Phát tiếng Ting và CHỜ nó kết thúc (Khắc phục lỗi ghi âm dính tiếng Ting)
-    await _playTingSoundAndWait();
-
-    // B3: Rung nhẹ báo hiệu
-    await rungNhe();
-
-    // B4: Bắt đầu ghi âm và chụp ảnh
-    batDauGhiAmVaBatCamera();
-  }
-
-  // Hàm phát âm thanh có cơ chế chờ (Blocking wait)
-  Future<void> _playTingSoundAndWait() async {
+  Future<void> _playEffect(String assetPath) async {
     try {
-      final completer = Completer<void>();
-
-      // Set source
-      await _effectPlayer.setSource(AssetSource('sounds/ting.mp3'));
-
-      // Lắng nghe sự kiện hoàn thành
-      StreamSubscription? subscription;
-      subscription = _effectPlayer.onPlayerComplete.listen((event) {
-        if (!completer.isCompleted) completer.complete();
-        subscription?.cancel();
-      });
-
-      // Bắt đầu phát
-      await _effectPlayer.resume();
-
-      // Fallback: Tự ngắt sau 1.5s phòng trường hợp lỗi không có event complete
-      Future.delayed(const Duration(milliseconds: 1500), () {
-        if (!completer.isCompleted) {
-          completer.complete();
-          subscription?.cancel();
-        }
-      });
-
-      await completer.future; // Code sẽ dừng ở đây cho đến khi ting xong
+      await _effectPlayer.play(AssetSource(assetPath));
+      if (kIsWeb) await Future.delayed(const Duration(milliseconds: 600));
     } catch (e) {
-      print("Lỗi phát Ting: $e");
+      print("Effect Error: $e");
     }
   }
 
-  Future<void> batDauGhiAmVaBatCamera() async {
+  Future<void> _startRecordingAndCamera() async {
     try {
-      _khoiTaoCamera(); // Bật cam ngầm song song
-
       if (await _audioRecorder.hasPermission()) {
-        final directory = await getTemporaryDirectory();
-        String path = '${directory.path}/lenh.wav';
+        setState(() {
+          _isRecording = true;
+          _imageFile = null;
+          _imageBytes = null;
+          status = "SPEAK NOW...";
+          lindaResponse = "";
+        });
 
-        // --- CẤU HÌNH ĐÃ SỬA ---
-        const config = RecordConfig(
-          encoder: AudioEncoder.wav,
-          sampleRate: 16000,
-          numChannels: 1,
-          // Đã xóa các tham số noiseSuppression/echoCancellation gây lỗi
+        const config = RecordConfig(encoder: AudioEncoder.opus);
+        await _audioRecorder.start(config, path: '');
+
+        Future.delayed(const Duration(milliseconds: 1500), () {
+          if (_isRecording) _captureSnapshot();
+        });
+
+        Future.delayed(const Duration(seconds: 4), _stopRecordingAndSend);
+      }
+    } catch (e) {
+      print("Recording Error: $e");
+      _resetSystem();
+    }
+  }
+
+  Future<void> _captureSnapshot() async {
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try {
+        print("📸 Taking Snapshot...");
+        final XFile photo = await _cameraController!.takePicture().timeout(
+          const Duration(seconds: 2),
+          onTimeout: () => throw TimeoutException("Camera slow"),
         );
 
+        final bytes = await photo.readAsBytes();
         if (mounted) {
           setState(() {
-            _isRecording = true;
-            _imageFile = null;
-            trangThai = "MỜI BẠN NÓI...";
-            cauTraLoiCuaLinda = "";
+            _imageFile = photo;
+            _imageBytes = bytes;
           });
         }
-
-        // --- Delay quan trọng để OS chuyển Mic mode ---
-        await Future.delayed(const Duration(milliseconds: 300));
-
-        // Đảm bảo không có tiến trình ghi âm nào đang chạy
-        if (await _audioRecorder.isRecording()) {
-          await _audioRecorder.stop();
-        }
-
-        await _audioRecorder.start(config, path: path);
-        print("2. Đang ghi âm...");
-
-        // Ghi âm trong 4 giây rồi tự dừng
-        Future.delayed(const Duration(seconds: 4), dungGhiAmVaChupAnh);
+        print("✅ Snapshot Success");
+      } catch (e) {
+        print("⚠️ Snapshot Failed: $e");
       }
-    } catch (e) {
-      print("Lỗi ghi âm: $e");
-      _resetHeThongDeLangNgheTiep();
+    } else {
+      print("⚠️ Camera not ready. Skipping.");
     }
   }
 
-  Future<void> dungGhiAmVaChupAnh() async {
-    if (!_isRecording) return; // Tránh gọi 2 lần
+  Future<void> _stopRecordingAndSend() async {
+    if (!_isRecording) return;
     if (!mounted) return;
 
     try {
-      print("3. Dừng ghi âm...");
       final path = await _audioRecorder.stop();
-      await rungNhe();
+      print("✅ Recording stopped. Blob URL: $path");
 
-      if (mounted) {
-        setState(() {
-          _isRecording = false;
-          _isProcessing = true;
-          trangThai = "ĐANG SUY NGHĨ...";
-        });
-      }
+      setState(() {
+        _isRecording = false;
+        _isProcessing = true;
+        status = "THINKING...";
+      });
 
-      // Chụp ảnh
-      if (_cameraController != null && _cameraController!.value.isInitialized) {
-        final XFile photo = await _cameraController!.takePicture();
-        print("4. Đã chụp ảnh");
+      if (_imageFile == null) await _captureSnapshot();
 
-        if (mounted) {
-          setState(() => _imageFile = File(photo.path));
-        }
-
-        _disposeCamera(); // Tắt cam ngay để tiết kiệm pin
-
-        // Gửi lên server
-        if (path != null) {
-          await guiDuLieuDaPhuongTien(File(path), File(photo.path));
-        } else {
-          print("File ghi âm bị null");
-          _resetHeThongDeLangNgheTiep();
-        }
+      if (path != null) {
+        await _sendToBackend(path, _imageFile);
       } else {
-        print("Camera chưa sẵn sàng");
-        _disposeCamera();
-        _resetHeThongDeLangNgheTiep();
+        setState(() => status = "Error: Audio Failed");
+        _resetSystem();
       }
     } catch (e) {
-      print("Lỗi quy trình dừng: $e");
-      _disposeCamera();
-      _resetHeThongDeLangNgheTiep();
+      print("❌ Stop Error: $e");
+      _resetSystem();
     }
   }
 
-  // --- HÀM RESET HỆ THỐNG ---
-  void _resetHeThongDeLangNgheTiep() {
-    print("--- RESET: LẮNG NGHE LẠI ---");
-    if (mounted) {
-      setState(() {
-        _isProcessing = false;
-        _isRecording = false;
-        trangThai = "SẴN SÀNG! NÓI 'HEY LINDA'";
-      });
-    }
-    // Chỉ bật lại Wake Word khi không bận
-    _startWakeWordListener();
-  }
-
-  Future<void> guiDuLieuDaPhuongTien(File audio, File image) async {
+  Future<void> _sendToBackend(String audioPathOrUrl, XFile? imageFile) async {
+    print("--- PREPARING TO SEND ---");
     try {
       var request = http.MultipartRequest('POST', Uri.parse(serverUrl));
 
-      request.files.add(
-        await http.MultipartFile.fromPath('audio_file', audio.path),
-      );
-      request.files.add(
-        await http.MultipartFile.fromPath('image_file', image.path),
-      );
+      if (kIsWeb) {
+        print("Fetching audio blob: $audioPathOrUrl");
+        final audioResponse = await http.get(
+          Uri.parse(audioPathOrUrl),
+          headers: {"Accept": "*/*"},
+        );
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'audio_file',
+            audioResponse.bodyBytes,
+            filename: 'command.webm',
+          ),
+        );
+      } else {
+        request.files.add(
+          await http.MultipartFile.fromPath('audio_file', audioPathOrUrl),
+        );
+      }
 
-      print("5. Đang gửi server...");
+      if (imageFile != null) {
+        final imageBytes = await imageFile.readAsBytes();
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'image_file',
+            imageBytes,
+            filename: 'image.jpg',
+          ),
+        );
+      } else {
+        print("⚠️ Sending Audio Only");
+      }
+
       var streamedResponse = await request.send();
       var response = await http.Response.fromStream(streamedResponse);
 
       if (response.statusCode == 200) {
         final data = json.decode(utf8.decode(response.bodyBytes));
-        String aiResponse = data['reply'] ?? "";
+        String textReply = data['reply'] ?? "";
 
-        if (mounted) {
-          setState(() {
-            trangThai = "ĐANG TRẢ LỜI...";
-            cauTraLoiCuaLinda = aiResponse;
-            _isProcessing = false;
-          });
-        }
+        setState(() {
+          status = "REPLYING...";
+          lindaResponse = textReply;
+          _isProcessing = false;
+        });
 
-        // Lưu Log
-        luuLichSuVaoFirestore("Audio Command", aiResponse);
-
-        // Phát âm thanh trả lời
-        if (data['audio_response'] != null) {
-          await phatAmThanhVaCho(data['audio_response']);
+        if (data['audio_response'] != null &&
+            data['audio_response'].isNotEmpty) {
+          await _playAuthResponse(data['audio_response']);
         } else {
-          // Nếu server không trả về audio thì chờ 3s rồi reset
-          Future.delayed(
-            const Duration(seconds: 3),
-            _resetHeThongDeLangNgheTiep,
-          );
+          Future.delayed(const Duration(seconds: 3), _resetSystem);
         }
       } else {
-        if (mounted)
-          setState(() => trangThai = "Lỗi Server: ${response.statusCode}");
-        Future.delayed(const Duration(seconds: 2), _resetHeThongDeLangNgheTiep);
+        setState(() => status = "Server Error: ${response.statusCode}");
+        Future.delayed(const Duration(seconds: 3), _resetSystem);
       }
     } catch (e) {
-      print("Lỗi kết nối Server: $e");
-      if (mounted) setState(() => trangThai = "Mất kết nối Server");
-      Future.delayed(const Duration(seconds: 2), _resetHeThongDeLangNgheTiep);
+      print("❌ ERROR: $e");
+      setState(() => status = "Connection Failed");
+      Future.delayed(const Duration(seconds: 3), _resetSystem);
     }
   }
 
-  Future<void> luuLichSuVaoFirestore(String cauHoi, String traLoi) async {
-    try {
-      await FirebaseFirestore.instance.collection('activity_logs').add({
-        'timestamp': FieldValue.serverTimestamp(),
-        'user_query': cauHoi,
-        'ai_response': traLoi,
-        'device_type': Platform.isAndroid ? 'Android' : 'iOS',
-        'status': 'success',
-      });
-    } catch (e) {
-      print("Lỗi lưu log Firebase: $e");
-    }
-  }
-
-  Future<void> rungNhe() async {
-    if (await Vibration.hasVibrator() ?? false) {
-      Vibration.vibrate(duration: 100);
-    }
-  }
-
-  // Hàm phát âm thanh trả lời cũng cần cơ chế Wait
-  Future<void> phatAmThanhVaCho(String base64String) async {
+  Future<void> _playAuthResponse(String base64String) async {
     try {
       Uint8List audioBytes = base64Decode(base64String);
-      final dir = await getTemporaryDirectory();
-      File file = File('${dir.path}/reply.mp3');
-      await file.writeAsBytes(audioBytes);
+      await _audioPlayer.play(BytesSource(audioBytes));
 
       final completer = Completer<void>();
-
-      await _audioPlayer.play(DeviceFileSource(file.path));
-
-      // Lắng nghe khi phát xong
       StreamSubscription? sub;
       sub = _audioPlayer.onPlayerComplete.listen((_) {
         if (!completer.isCompleted) completer.complete();
         sub?.cancel();
       });
 
-      await completer.future; // Chờ Linda nói xong
-
-      // Nói xong mới Reset để nghe lệnh tiếp theo
-      _resetHeThongDeLangNgheTiep();
+      await completer.future;
+      _resetSystem();
     } catch (e) {
-      print("Lỗi phát reply: $e");
-      _resetHeThongDeLangNgheTiep();
+      print("Playback Error: $e");
+      _resetSystem();
+    }
+  }
+
+  void _resetSystem() {
+    if (mounted) {
+      setState(() {
+        _isProcessing = false;
+        _isRecording = false;
+        status = "READY";
+      });
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+
     return Scaffold(
-      floatingActionButton: FloatingActionButton(
-        backgroundColor: _isRecording ? Colors.red : Colors.blueGrey,
-        onPressed: () {
-          // Cho phép kích hoạt bằng nút bấm thủ công
-          if (!_isRecording && !_isProcessing) {
-            _wakeWordCallback(0); // Giả lập như nghe thấy từ khóa
-          }
-        },
-        child: Icon(_isRecording ? Icons.stop : Icons.mic),
-      ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-
-      body: Container(
-        color: Colors.black,
-        child: Column(
-          children: [
-            // Preview Camera ẩn (1x1 pixel)
+      body: Stack(
+        children: [
+          if (_cameraController != null &&
+              _cameraController!.value.isInitialized)
             SizedBox(
-              width: 1,
-              height: 1,
-              child:
-                  (_cameraController != null &&
-                      _cameraController!.value.isInitialized)
-                  ? CameraPreview(_cameraController!)
-                  : Container(),
-            ),
-
-            Expanded(
-              child: Center(
-                child: SingleChildScrollView(
-                  // Thêm scroll để không bị lỗi overflow khi text dài
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      if (_imageFile != null)
-                        Container(
-                          height: 200,
-                          width: 200,
-                          margin: const EdgeInsets.only(bottom: 20),
-                          decoration: BoxDecoration(
-                            border: Border.all(color: Colors.white, width: 2),
-                            borderRadius: BorderRadius.circular(15),
-                          ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(13),
-                            child: Image.file(_imageFile!, fit: BoxFit.cover),
-                          ),
-                        ),
-
-                      Icon(
-                        _isRecording
-                            ? Icons.mic
-                            : (_isProcessing ? Icons.sync : Icons.hearing),
-                        size: 100,
-                        color: _isRecording
-                            ? Colors.redAccent
-                            : (_isProcessing
-                                  ? Colors.blueAccent
-                                  : Colors.greenAccent),
+              width: size.width,
+              height: size.height,
+              child: FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: _cameraController!.value.previewSize!.width,
+                  height: _cameraController!.value.previewSize!.height,
+                  child: CameraPreview(_cameraController!),
+                ),
+              ),
+            )
+          else
+            Positioned.fill(
+              child: Container(
+                color: Colors.grey[900],
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(
+                      Icons.videocam_off,
+                      size: 50,
+                      color: Colors.white24,
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      "No Camera / Audio Only",
+                      style: TextStyle(color: Colors.white38),
+                    ),
+                    if (_cameras.isEmpty)
+                      TextButton(
+                        onPressed: _initSystem,
+                        child: const Text("Retry Camera"),
                       ),
-                      const SizedBox(height: 20),
-                      Text(
-                        trangThai,
-                        style: TextStyle(
-                          color: _isRecording ? Colors.red : Colors.greenAccent,
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 20),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
-                        child: Text(
-                          cauTraLoiCuaLinda,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 20,
-                            height: 1.5,
-                          ),
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-                    ],
-                  ),
+                  ],
                 ),
               ),
             ),
-          ],
-        ),
+
+          Positioned.fill(
+            child: Container(color: Colors.black.withOpacity(0.6)),
+          ),
+
+          Center(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (_imageBytes != null)
+                    Container(
+                      height: 200,
+                      width: 200,
+                      margin: const EdgeInsets.only(bottom: 30),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.cyanAccent, width: 3),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(16),
+                        child: Image.memory(_imageBytes!, fit: BoxFit.cover),
+                      ),
+                    ),
+
+                  Text(
+                    status,
+                    style: TextStyle(
+                      color: _isRecording
+                          ? Colors.redAccent
+                          : Colors.cyanAccent,
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 40),
+
+                  GestureDetector(
+                    onTap: startInteraction,
+                    child: Container(
+                      padding: const EdgeInsets.all(30),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _isRecording
+                            ? Colors.red
+                            : Colors.white.withOpacity(0.1),
+                        border: Border.all(
+                          color: _isRecording
+                              ? Colors.redAccent
+                              : Colors.white54,
+                          width: 4,
+                        ),
+                        boxShadow: [
+                          if (_isProcessing)
+                            BoxShadow(
+                              color: Colors.blueAccent.withOpacity(0.5),
+                              blurRadius: 40,
+                              spreadRadius: 10,
+                            ),
+                        ],
+                      ),
+                      child: Icon(
+                        _isProcessing
+                            ? Icons.sync
+                            : (_isRecording ? Icons.stop : Icons.mic),
+                        size: 60,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 40),
+
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 40),
+                    child: Text(
+                      lindaResponse,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        height: 1.4,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
